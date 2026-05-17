@@ -6,10 +6,26 @@ import time
 import re
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, errors, Button
-from telethon.tl.types import MessageMediaWebPage, MessageMediaUnsupported, MessageEmpty
+from telethon.tl.types import (
+    MessageMediaWebPage, MessageMediaUnsupported, MessageEmpty,
+    MessageMediaPhoto, MessageMediaDocument,
+    InputMediaDocument, InputMediaPhoto,
+    InputDocument, InputPhoto,
+    DocumentAttributeVideo, DocumentAttributeImageSize, DocumentAttributeFilename
+)
+from telethon.tl.functions.messages import SendMediaRequest, SendMessageRequest
 from telethon import functions, types
+import mimetypes
+from fast_telethon import FastTelethon
+
+# Thread pool for blocking operations (FFmpeg, disk I/O)
+_thread_pool = ThreadPoolExecutor(max_workers=4)
+
+# Number of parallel consumer workers for concurrent forwarding
+NUM_WORKERS = 3
 
 # Configure logging
 logging.basicConfig(
@@ -26,10 +42,7 @@ FFMPEG_AVAILABLE = bool(shutil.which("ffmpeg"))
 if FFMPEG_AVAILABLE:
     logger.info("FFmpeg detected. Streamable video processing is ENABLED.")
 else:
-    logger.warning(
-        "FFmpeg not found in PATH. Videos will be uploaded without fast-start processing. "
-        "Install FFmpeg (https://ffmpeg.org/download.html) and add it to PATH to enable streaming."
-    )
+    logger.info("FFmpeg not found in PATH. Fast-start streamable processing disabled.")
 
 # State Machine for the Bot Conversation
 user_states = {}
@@ -68,7 +81,7 @@ def format_size(size_bytes):
 
 def format_caption(template, message):
     if not template or template == 'keep':
-        return message.text
+        return message.message or ""
     if template == 'remove':
         return ""
         
@@ -80,12 +93,14 @@ def format_caption(template, message):
         size = format_size(message.file.size)
         
     date_str = message.date.strftime("%Y-%m-%d %H:%M:%S") if message.date else "Unknown"
-    original_caption = message.text or ""
+    
+    from telethon.extensions import markdown
+    original_caption_md = markdown.unparse(message.message or "", message.entities or [])
     
     formatted = template.replace("{filename}", filename)
     formatted = formatted.replace("{size}", size)
     formatted = formatted.replace("{date}", date_str)
-    formatted = formatted.replace("{original_caption}", original_caption)
+    formatted = formatted.replace("{original_caption}", original_caption_md)
     
     return formatted
 
@@ -141,51 +156,44 @@ async def get_original_thumb(client, message):
         logger.warning(f"Could not extract original thumbnail: {e}")
     return None
 
-def process_video_for_streaming(input_path):
-    """
-    Run FFmpeg to:
-    1. Move the moov atom to the beginning (fast-start) so Telegram can stream it.
-    2. Edit metadata: clear old title/artist/author, optionally set new ones.
-    Returns the output path or None if FFmpeg failed/unavailable.
-    """
-    if not FFMPEG_AVAILABLE:
-        return None
-    
+def _ffmpeg_run_sync(input_path):
+    """Synchronous FFmpeg call — intended to run in a thread pool."""
     base, ext = os.path.splitext(input_path)
     output_path = base + "_streamable" + (ext if ext else ".mp4")
-    
     cmd = [
         "ffmpeg", "-y",
         "-i", input_path,
-        "-c", "copy",                    # Re-mux only — no re-encoding (fast!)
-        "-movflags", "+faststart",        # Move moov atom to front (streamable)
-        "-metadata", "title=",           # Clear title
-        "-metadata", "artist=",          # Clear artist
-        "-metadata", "author=",          # Clear author
-        "-metadata", "comment=",         # Clear comment
+        "-c", "copy",
+        "-movflags", "+faststart",
+        "-metadata", "title=",
+        "-metadata", "artist=",
+        "-metadata", "author=",
+        "-metadata", "comment=",
         output_path
     ]
-    
     try:
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            timeout=120,
-        )
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
         if result.returncode == 0 and os.path.exists(output_path):
-            logger.info(f"FFmpeg processing complete: {output_path}")
             return output_path
-        else:
-            err = result.stderr.decode('utf-8', errors='ignore')[-500:]
-            logger.error(f"FFmpeg processing failed: {err}")
-            return None
+        err = result.stderr.decode('utf-8', errors='ignore')[-500:]
+        logger.error(f"FFmpeg failed: {err}")
+        return None
     except subprocess.TimeoutExpired:
         logger.error("FFmpeg timed out.")
         return None
     except Exception as e:
         logger.error(f"FFmpeg exception: {e}")
         return None
+
+async def process_video_for_streaming(input_path):
+    """Non-blocking FFmpeg: runs in thread pool so asyncio loop is never blocked."""
+    if not FFMPEG_AVAILABLE:
+        return None
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(_thread_pool, _ffmpeg_run_sync, input_path)
+    if result:
+        logger.info(f"FFmpeg processing complete: {result}")
+    return result
 
 async def bot_respond(event, text):
     """
@@ -207,178 +215,325 @@ async def safe_bot_edit(bot_client, chat_id, msg_id, text):
 
 async def forward_message(client, message, dest_group, thumb_path, caption_rule,
                           bot_client=None, admin_id=None, status_msg_id=None, progress_ctx=None):
-    needs_copy = False
 
-    if thumb_path or (caption_rule not in ('keep', None)):
-        needs_copy = True
+    from telethon.extensions import markdown as md_ext
 
-    if not needs_copy:
+    # Build final caption + entities
+    final_caption = format_caption(caption_rule, message)
+    is_custom_cap = caption_rule and caption_rule not in ('keep', 'remove', None)
+
+    if caption_rule == 'keep' or not caption_rule:
+        if message.entities:
+            final_entities = message.entities
+            final_parse_mode = None
+        elif final_caption and ('**' in (final_caption or '') or '__' in (final_caption or '')):
+            final_entities = None
+            final_parse_mode = 'md'
+        else:
+            final_entities = None
+            final_parse_mode = None
+    else:
+        final_entities = None
+        final_parse_mode = 'md' if is_custom_cap else None
+
+    dest_peer = await client.get_input_entity(dest_group)
+
+    # Resolve caption text + entities for SendMediaRequest
+    if final_parse_mode == 'md' and final_caption:
+        from telethon.extensions import markdown
+        msg_text, msg_entities = markdown.parse(final_caption)
+    elif final_entities:
+        msg_text = final_caption or ''
+        msg_entities = final_entities
+    else:
+        msg_text = final_caption or ''
+        msg_entities = []
+
+    # ---------------------------------------------------------------
+    # TIER 1: True server-side copy via InputMedia references
+    # Telegram copies the file on their servers — zero bytes transferred.
+    # Works for any file size in milliseconds.
+    # ---------------------------------------------------------------
+    if not thumb_path:
         try:
-            await client.forward_messages(dest_group, message)
-            logger.info(f"Message {message.id} forwarded successfully (Native).")
-            return 'direct'
-        except errors.rpcerrorlist.ChatForwardsRestrictedError:
-            logger.warning(f"Message {message.id}: Chat protected. Falling back to copy...")
-            needs_copy = True
-        except Exception as e:
-            logger.error(f"Error natively forwarding message {message.id}: {e}")
-            return False
+            if isinstance(message.media, MessageMediaDocument) and message.document:
+                doc = message.document
+                input_media = InputMediaDocument(
+                    id=InputDocument(
+                        id=doc.id,
+                        access_hash=doc.access_hash,
+                        file_reference=doc.file_reference
+                    ),
+                    spoiler=False
+                )
+                await client(SendMediaRequest(
+                    peer=dest_peer,
+                    media=input_media,
+                    message=msg_text,
+                    entities=msg_entities
+                ))
+                logger.info(f"Message {message.id} server-copied (Document) instantly.")
+                return 'fast_copy'
 
-    if needs_copy:
-        path = None
-        streamable_path = None
+            elif isinstance(message.media, MessageMediaPhoto) and message.photo:
+                photo = message.photo
+                input_media = InputMediaPhoto(
+                    id=InputPhoto(
+                        id=photo.id,
+                        access_hash=photo.access_hash,
+                        file_reference=photo.file_reference
+                    ),
+                    spoiler=False
+                )
+                await client(SendMediaRequest(
+                    peer=dest_peer,
+                    media=input_media,
+                    message=msg_text,
+                    entities=msg_entities
+                ))
+                logger.info(f"Message {message.id} server-copied (Photo) instantly.")
+                return 'fast_copy'
+
+            elif not message.media or isinstance(message.media, (MessageMediaWebPage, MessageMediaUnsupported)):
+                # Text-only
+                if msg_text:
+                    await client(SendMessageRequest(
+                        peer=dest_peer,
+                        message=msg_text,
+                        entities=msg_entities
+                    ))
+                    logger.info(f"Message {message.id} sent as text.")
+                return 'fast_copy'
+
+        except errors.FileReferenceExpiredError:
+            logger.warning(f"Message {message.id}: File reference expired. Refreshing and retrying...")
+            # Refresh the message from server to get a fresh file_reference
+            try:
+                fresh_msg = await client.get_messages(message.chat_id or message.peer_id, ids=message.id)
+                if fresh_msg:
+                    message = fresh_msg
+                    # Recurse once with fresh reference
+                    return await forward_message(
+                        client, message, dest_group, thumb_path, caption_rule,
+                        bot_client=bot_client, admin_id=admin_id,
+                        status_msg_id=status_msg_id, progress_ctx=progress_ctx
+                    )
+            except Exception as refresh_e:
+                logger.warning(f"Refresh failed: {refresh_e}. Falling back to download...")
+        except (errors.ChatForwardsRestrictedError, errors.MediaEmptyError,
+                errors.MessageIdInvalidError, errors.FileIdInvalidError):
+            logger.info(f"Message {message.id}: Server-copy blocked by Telegram. Falling back to download/upload...")
+        except Exception as e:
+            logger.warning(f"Server-copy failed for {message.id}: {e}. Falling back to download...")
+
+    # ---------------------------------------------------------------
+    # TIER 2: send_file with media reference (catches other media types)
+    # ---------------------------------------------------------------
+    if not thumb_path:
         try:
             if message.media and not isinstance(message.media, (MessageMediaWebPage, MessageMediaUnsupported)):
-                file_size = message.file.size if message.file else 0
-                # Use MIME-inferred extension instead of blindly using 'file.bin'
-                file_name = get_proper_filename(message)
-                final_caption = format_caption(caption_rule, message)
-                is_custom_cap = caption_rule and caption_rule not in ('keep', 'remove', None)
-                # For 'keep' mode: use original entities if present.
-                # If entities are missing but text has Markdown syntax (**bold**), auto-parse.
-                if caption_rule == 'keep' or not caption_rule:
-                    if message.entities:
-                        final_entities = message.entities
-                        final_parse_mode = None
-                    elif final_caption and ('**' in (final_caption or '') or '__' in (final_caption or '')):
-                        final_entities = None
-                        final_parse_mode = 'md'
-                    else:
-                        final_entities = None
-                        final_parse_mode = None
-                else:
-                    final_entities = None
-                    final_parse_mode = 'md' if is_custom_cap else None
+                await client.send_file(
+                    dest_group,
+                    message.media,
+                    caption=final_caption,
+                    formatting_entities=final_entities,
+                    parse_mode=final_parse_mode
+                )
+                logger.info(f"Message {message.id} copied via send_file reference.")
+                return 'fast_copy'
+        except (errors.ChatForwardsRestrictedError, errors.MediaEmptyError,
+                errors.FileReferenceExpiredError, errors.MessageIdInvalidError):
+            logger.info(f"Message {message.id}: send_file reference failed. Falling back to download/upload...")
+        except Exception as e:
+            logger.warning(f"send_file reference failed for {message.id}: {e}. Falling back to download...")
 
-                # --- Download progress callback for large files ---
+    # --- 2. Fallback to Full Download/Upload ---
+    path = None
+    streamable_path = None
+    try:
+        if message.media and not isinstance(message.media, (MessageMediaWebPage, MessageMediaUnsupported)):
+            file_size = message.file.size if message.file else 0
+            # Use MIME-inferred extension instead of blindly using 'file.bin'
+            file_name = get_proper_filename(message)
+
+            # --- Download progress callback for large files ---
+            _last_dl_update = [0.0]
+            async def dl_progress(current, total):
+                now = time.time()
+                if now - _last_dl_update[0] > 4 and bot_client and admin_id and status_msg_id and progress_ctx:
+                    _last_dl_update[0] = now
+                    pct = (current / total * 100) if total else 0
+                    ctx = progress_ctx.copy()
+                    txt = (
+                        f"⏳ **Hybrid Forwarding Engine**\n\n"
+                        f"📥 Downloading Msg `{message.id}`... {pct:.1f}%\n"
+                        f"   ({format_size(current)} / {format_size(total)})\n\n"
+                        f"Processed: {ctx.get('processed',0)}/{ctx.get('total',0)}\n"
+                        f"Successful: {ctx.get('success',0)}"
+                    )
+                    await safe_bot_edit(bot_client, admin_id, status_msg_id, txt)
+
+            # Hybrid memory/disk upload
+            # Determine unique download path per user + message to avoid conflicts
+            uid = admin_id or 'shared'
+            safe_name = re.sub(r'[^\w.]', '_', file_name)
+            unique_prefix = f"{uid}_{message.id}_"
+
+            if file_size and file_size < 10 * 1024 * 1024:  # < 10 MB: download to memory
+                logger.info(f"Message {message.id}: Small file ({format_size(file_size)}), downloading to memory...")
+                mem_bytes = await client.download_media(message, file=bytes)
+                if mem_bytes:
+                    bio = io.BytesIO(mem_bytes)
+                    bio.name = file_name
+                    is_vid = file_name and is_video_file(file_name)
+                    is_img = file_name and is_image_file(file_name)
+                    # Smart thumb: custom thumb only for videos, not images
+                    effective_thumb = None
+                    if is_vid:
+                        if thumb_path:
+                            effective_thumb = thumb_path
+                        else:
+                            effective_thumb = await get_original_thumb(client, message)
+                    # images get no thumb override
+                    await client.send_file(
+                        dest_group, file=bio,
+                        caption=final_caption,
+                        formatting_entities=final_entities,
+                        parse_mode=final_parse_mode,
+                        thumb=effective_thumb,
+                        supports_streaming=bool(is_vid)
+                    )
+                else:
+                    await client.send_message(dest_group, final_caption or "", formatting_entities=final_entities)
+
+            else:  # Large file: stream to disk with progress + unique name
+                logger.info(f"Message {message.id}: Large file ({format_size(file_size)}), downloading to disk ({uid})...")
+                os.makedirs(TEMP_DIR, exist_ok=True)
+                dl_target = os.path.join(TEMP_DIR, unique_prefix + safe_name)
+
+                # Notify user that download is starting
+                if bot_client and admin_id:
+                    await bot_client.send_message(
+                        admin_id,
+                        f"📥 **Downloading large file...**\n"
+                        f"📌 Msg `{message.id}` | 📦 Size: {format_size(file_size)}\n"
+                        f"⏳ Please wait..."
+                    )
+
+                # Use native Telethon download — handles DC migration, auth, protected chats reliably
                 _last_dl_update = [0.0]
+                _dl_msg_id = [None]
+
                 async def dl_progress(current, total):
                     now = time.time()
-                    if now - _last_dl_update[0] > 4 and bot_client and admin_id and status_msg_id and progress_ctx:
+                    if now - _last_dl_update[0] > 3 and bot_client and admin_id:
                         _last_dl_update[0] = now
                         pct = (current / total * 100) if total else 0
-                        ctx = progress_ctx.copy()
                         txt = (
-                            f"⏳ **Hybrid Forwarding Engine**\n\n"
-                            f"📥 Downloading Msg `{message.id}`... {pct:.1f}%\n"
-                            f"   ({format_size(current)} / {format_size(total)})\n\n"
-                            f"Processed: {ctx.get('processed',0)}/{ctx.get('total',0)}\n"
-                            f"Successful: {ctx.get('success',0)}"
+                            f"📥 **Downloading...**\n"
+                            f"📌 Msg `{message.id}` | {pct:.1f}%\n"
+                            f"   {format_size(current)} / {format_size(total)}"
                         )
-                        await safe_bot_edit(bot_client, admin_id, status_msg_id, txt)
+                        if _dl_msg_id[0]:
+                            await safe_bot_edit(bot_client, admin_id, _dl_msg_id[0], txt)
+                        else:
+                            sent = await bot_client.send_message(admin_id, txt)
+                            _dl_msg_id[0] = sent.id
 
-                # Hybrid memory/disk upload
-                # Determine unique download path per user + message to avoid conflicts
-                uid = admin_id or 'shared'
-                safe_name = re.sub(r'[^\w.]', '_', file_name)
-                unique_prefix = f"{uid}_{message.id}_"
+                path = await client.download_media(message, file=dl_target, progress_callback=dl_progress)
 
-                if file_size and file_size < 10 * 1024 * 1024:  # < 10 MB: download to memory
-                    logger.info(f"Message {message.id}: Small file ({format_size(file_size)}), downloading to memory...")
-                    mem_bytes = await client.download_media(message, file=bytes)
-                    if mem_bytes:
-                        bio = io.BytesIO(mem_bytes)
-                        bio.name = file_name
-                        is_vid = file_name and is_video_file(file_name)
-                        is_img = file_name and is_image_file(file_name)
-                        # Smart thumb: custom thumb only for videos, not images
-                        effective_thumb = None
-                        if is_vid:
-                            if thumb_path:
-                                effective_thumb = thumb_path
-                            else:
-                                effective_thumb = await get_original_thumb(client, message)
-                        # images get no thumb override
+                if path:
+                    upload_path = path
+                    is_vid = is_video_file(path)
+
+                    # Apply FFmpeg fast-start for video files (makes them streamable)
+                    if is_vid and FFMPEG_AVAILABLE:
+                        logger.info(f"Message {message.id}: Applying FFmpeg fast-start (non-blocking)...")
+                        streamable_path = await process_video_for_streaming(path)
+                        if streamable_path:
+                            upload_path = streamable_path
+
+                    # Smart thumb
+                    effective_thumb = None
+                    if is_vid:
+                        if thumb_path:
+                            effective_thumb = thumb_path
+                        else:
+                            effective_thumb = await get_original_thumb(client, message)
+
+                    # Upload with FastTelethon parallel uploader (much faster than sequential)
+                    if bot_client and admin_id:
+                        up_notify = await bot_client.send_message(
+                            admin_id,
+                            f"📤 **Uploading...**\n📌 Msg `{message.id}` | 📦 {format_size(os.path.getsize(upload_path))}"
+                        )
+                    else:
+                        up_notify = None
+
+                    _last_ul_update = [0.0]
+                    async def ul_progress(current, total):
+                        now = time.time()
+                        if now - _last_ul_update[0] > 3 and bot_client and admin_id and up_notify:
+                            _last_ul_update[0] = now
+                            pct = (current / total * 100) if total else 0
+                            txt = (
+                                f"📤 **Uploading...**\n"
+                                f"📌 Msg `{message.id}` | {pct:.1f}%\n"
+                                f"   {format_size(current)} / {format_size(total)}"
+                            )
+                            await safe_bot_edit(bot_client, admin_id, up_notify.id, txt)
+
+                    fast_up = FastTelethon(client)
+                    uploaded_file = await fast_up.upload_file(upload_path, progress_callback=ul_progress)
+
+                    if uploaded_file:
+                        doc_attrs = None
+                        if hasattr(message, 'document') and message.document:
+                            doc_attrs = message.document.attributes
                         await client.send_file(
-                            dest_group, file=bio,
+                            dest_group, uploaded_file,
                             caption=final_caption,
                             formatting_entities=final_entities,
                             parse_mode=final_parse_mode,
                             thumb=effective_thumb,
-                            supports_streaming=bool(is_vid)
+                            supports_streaming=bool(is_vid),
+                            attributes=doc_attrs
                         )
                     else:
-                        await client.send_message(dest_group, final_caption or "", formatting_entities=final_entities)
-
-                else:  # Large file: stream to disk with progress + unique name
-                    logger.info(f"Message {message.id}: Large file ({format_size(file_size)}), streaming to disk ({uid})...")
-                    os.makedirs(TEMP_DIR, exist_ok=True)
-                    # Use unique filename so multiple users don't overwrite each other
-                    dl_target = os.path.join(TEMP_DIR, unique_prefix + safe_name)
-                    path = await client.download_media(message, file=dl_target, progress_callback=dl_progress)
-
-                    if path:
-                        upload_path = path
-                        is_vid = is_video_file(path)
-
-                        # Apply FFmpeg fast-start for video files (makes them streamable)
-                        if is_vid and FFMPEG_AVAILABLE:
-                            logger.info(f"Message {message.id}: Applying FFmpeg fast-start...")
-                            if bot_client and admin_id and status_msg_id:
-                                await safe_bot_edit(bot_client, admin_id, status_msg_id,
-                                    f"⚙️ Processing video {message.id} with FFmpeg (fast-start)...")
-                            streamable_path = process_video_for_streaming(path)
-                            if streamable_path:
-                                upload_path = streamable_path
-
-                        # Smart thumb: custom for videos, original for videos with no custom, none for images
-                        effective_thumb = None
-                        if is_vid:
-                            if thumb_path:
-                                effective_thumb = thumb_path
-                            else:
-                                effective_thumb = await get_original_thumb(client, message)
-
-                        # Upload progress callback
-                        _last_ul_update = [0.0]
-                        async def ul_progress(current, total):
-                            now = time.time()
-                            if now - _last_ul_update[0] > 4 and bot_client and admin_id and status_msg_id and progress_ctx:
-                                _last_ul_update[0] = now
-                                pct = (current / total * 100) if total else 0
-                                ctx = progress_ctx.copy()
-                                txt = (
-                                    f"⏳ **Hybrid Forwarding Engine**\n\n"
-                                    f"📤 Uploading Msg `{message.id}`... {pct:.1f}%\n"
-                                    f"   ({format_size(current)} / {format_size(total)})\n\n"
-                                    f"Processed: {ctx.get('processed',0)}/{ctx.get('total',0)}\n"
-                                    f"Successful: {ctx.get('success',0)}"
-                                )
-                                await safe_bot_edit(bot_client, admin_id, status_msg_id, txt)
-
+                        logger.error(f"FastTelethon upload failed for msg {message.id}, trying native upload...")
                         await client.send_file(
                             dest_group, upload_path,
                             caption=final_caption,
                             formatting_entities=final_entities,
                             parse_mode=final_parse_mode,
                             thumb=effective_thumb,
-                            supports_streaming=bool(is_vid),
-                            progress_callback=ul_progress
+                            supports_streaming=bool(is_vid)
                         )
-                    else:
-                        await client.send_message(dest_group, final_caption or "", formatting_entities=final_entities)
-            else:
-                # Text-only message
-                final_caption = format_caption(caption_rule, message)
-                is_custom = caption_rule and caption_rule not in ('keep', 'remove', None)
-                if final_caption:
-                    if is_custom:
-                        await client.send_message(dest_group, final_caption, parse_mode='md')
-                    elif message.entities:
-                        await client.send_message(dest_group, final_caption, formatting_entities=message.entities)
-                    elif '**' in final_caption or '__' in final_caption:
-                        # Original text has raw markdown but no entities - parse it
-                        await client.send_message(dest_group, final_caption, parse_mode='md')
-                    else:
-                        await client.send_message(dest_group, final_caption)
-                    
-            logger.info(f"Message {message.id} copied/sent successfully.")
-            return 'copy'
 
-        except Exception as copy_e:
-            logger.error(f"Error copying message {message.id}: {copy_e}")
-            return False
-        finally:
+                else:
+                    await client.send_message(dest_group, final_caption or "", formatting_entities=final_entities)
+        else:
+            # Text-only message
+            final_caption = format_caption(caption_rule, message)
+            is_custom = caption_rule and caption_rule not in ('keep', 'remove', None)
+            if final_caption:
+                if is_custom:
+                    await client.send_message(dest_group, final_caption, parse_mode='md')
+                elif message.entities:
+                    await client.send_message(dest_group, final_caption, formatting_entities=message.entities)
+                elif '**' in final_caption or '__' in final_caption:
+                    # Original text has raw markdown but no entities - parse it
+                    await client.send_message(dest_group, final_caption, parse_mode='md')
+                else:
+                    await client.send_message(dest_group, final_caption)
+                
+        logger.info(f"Message {message.id} copied/sent successfully.")
+        return 'copy'
+
+    except Exception as copy_e:
+        logger.error(f"Error copying message {message.id}: {copy_e}")
+        return False
+    finally:
             # Guarantee cleanup of ALL temp files
             for p in [path, streamable_path]:
                 if p and os.path.exists(p):
@@ -417,78 +572,41 @@ async def start_forwarding_task(user_client, chat_id, start_id, end_id, dest_gro
         current_msg_id = start_id
         progress_ctx = {'processed': 0, 'total': total_ids, 'success': 0}
 
-        # --- Detect if forwarding is allowed ONCE by probing the first real message ---
-        group_forward_allowed = None  # None = not yet detected
-        logger.info(f"[User {admin_id}] Probing source group for forward restrictions...")
-        for probe_id in range(start_id, end_id + 1):
-            probe_msg = await user_client.get_messages(entity, ids=probe_id)
-            if probe_msg and not isinstance(probe_msg, MessageEmpty):
-                try:
-                    await user_client.forward_messages(dest_group, probe_msg)
-                    group_forward_allowed = True
-                    success += 1
-                    processed += 1
-                    progress_ctx.update({'processed': processed, 'success': success})
-                    logger.info(f"[User {admin_id}] ✅ Forwarding ALLOWED. Using native forward for all messages.")
-                except errors.rpcerrorlist.ChatForwardsRestrictedError:
-                    group_forward_allowed = False
-                    processed += 1
-                    logger.info(f"[User {admin_id}] 🔒 Forwarding RESTRICTED. Using Copy/Send for all messages.")
-                except Exception as e:
-                    group_forward_allowed = False
-                    processed += 1
-                    logger.warning(f"[User {admin_id}] Probe failed ({e}), defaulting to Copy/Send.")
-                start_id = probe_id + 1  # Continue from next message
-                break
-            else:
-                skipped += 1
-                processed += 1
+        mode_label = "Fast Copy / Hybrid Download"
 
-        if group_forward_allowed is None:
-            await bot_client.send_message(admin_id, "⚠️ Could not find any messages in the given range.")
-            return
+        # Save to global stats for /status
+        if admin_id in forwarding_tasks:
+            forwarding_tasks[admin_id]['stats'] = {
+                'total': total_ids, 'processed': 0, 'success': 0, 'skipped': 0,
+                'current_msg_id': start_id, 'mode': mode_label
+            }
 
         ffmpeg_status = "✅ On" if FFMPEG_AVAILABLE else "❌ Off"
-        mode_label = "Native Forward" if group_forward_allowed else "Copy/Send (Protected)"
         await safe_bot_edit(bot_client, admin_id, status_msg.id,
-            f"🔍 Detection complete!\nMode: **{mode_label}**\nFFmpeg: {ffmpeg_status}\n\nStarting...")
+            f"🔍 Chat resolved!\nMode: **{mode_label}**\nFFmpeg: {ffmpeg_status}\n\nStarting...")
 
-        # --- Pipeline: asyncio Queue for parallel download→upload ---
-        upload_queue = asyncio.Queue(maxsize=2)  # bounded: max 2 items buffered
+        # --- High-Performance Pipeline: batch fetch + multiple parallel workers ---
+        # Bounded queue: enough buffer for all workers to stay busy
+        upload_queue = asyncio.Queue(maxsize=NUM_WORKERS * 3)
         SENTINEL = object()
 
-        async def producer():
-            """Fetch messages and enqueue them for processing."""
-            nonlocal skipped
-            for msg_id in range(start_id, end_id + 1):
-                logger.info(f"[User {admin_id}] Fetching message {msg_id}...")
-                try:
-                    message = await user_client.get_messages(entity, ids=msg_id)
-                    if message and not isinstance(message, MessageEmpty):
-                        await upload_queue.put(message)
-                    else:
+        # --- High-Performance Sequential Pipeline ---
+        # We fetch messages in batches to reduce API latency, then process them sequentially to guarantee exact order.
+        all_ids = list(range(start_id, end_id + 1))
+        BATCH = 100  # Telegram allows up to 100 IDs per request
+        
+        for i in range(0, len(all_ids), BATCH):
+            batch_ids = all_ids[i:i + BATCH]
+            try:
+                messages = await user_client.get_messages(entity, ids=batch_ids)
+                # get_messages with a list returns results in the exact same order
+                for message in messages:
+                    if not message or isinstance(message, MessageEmpty):
                         skipped += 1
-                        logger.info(f"[User {admin_id}] Message {msg_id} empty/deleted. Skipping.")
-                except Exception as e:
-                    logger.error(f"[User {admin_id}] Fetch error msg {msg_id}: {e}")
-                    skipped += 1
-            await upload_queue.put(SENTINEL)
-
-        async def consumer():
-            """Process queued messages: forward or copy/send."""
-            nonlocal processed, success
-            while True:
-                item = await upload_queue.get()
-                if item is SENTINEL:
-                    upload_queue.task_done()
-                    break
-                message = item
-                try:
-                    if group_forward_allowed:
-                        await user_client.forward_messages(dest_group, message)
-                        logger.info(f"Message {message.id} forwarded (Native).")
-                        success += 1
-                    else:
+                        processed += 1
+                        continue
+                        
+                    try:
                         res = await forward_message(
                             user_client, message, dest_group, thumb_path, caption_rule,
                             bot_client=bot_client, admin_id=admin_id,
@@ -496,17 +614,11 @@ async def start_forwarding_task(user_client, chat_id, start_id, end_id, dest_gro
                         )
                         if res:
                             success += 1
-                    await asyncio.sleep(1.5)
-                except errors.FloodWaitError as fw:
-                    logger.warning(f"FloodWait {fw.seconds}s for msg {message.id}. Waiting...")
-                    await bot_client.send_message(admin_id, f"⏳ FloodWait: pausing {fw.seconds}s...")
-                    await asyncio.sleep(fw.seconds + 2)
-                    # Retry
-                    try:
-                        if group_forward_allowed:
-                            await user_client.forward_messages(dest_group, message)
-                            success += 1
-                        else:
+                    except errors.FloodWaitError as fw:
+                        logger.warning(f"FloodWait {fw.seconds}s for msg {message.id}. Waiting...")
+                        await bot_client.send_message(admin_id, f"⏳ FloodWait: pausing {fw.seconds}s...")
+                        await asyncio.sleep(fw.seconds + 2)
+                        try:
                             res = await forward_message(
                                 user_client, message, dest_group, thumb_path, caption_rule,
                                 bot_client=bot_client, admin_id=admin_id,
@@ -514,32 +626,40 @@ async def start_forwarding_task(user_client, chat_id, start_id, end_id, dest_gro
                             )
                             if res:
                                 success += 1
-                    except Exception as retry_e:
-                        logger.error(f"Retry failed for msg {message.id}: {retry_e}")
-                except Exception as e:
-                    logger.error(f"[User {admin_id}] Error processing msg {message.id}: {e}")
-                finally:
-                    processed += 1
-                    progress_ctx.update({'processed': processed, 'success': success})
-                    upload_queue.task_done()
+                        except Exception as retry_e:
+                            logger.error(f"Retry failed for msg {message.id}: {retry_e}")
+                    except Exception as e:
+                        logger.error(f"Error processing msg {message.id}: {e}")
+                    finally:
+                        processed += 1
+                        progress_ctx.update({'processed': processed, 'success': success})
+                        
+                        if admin_id in forwarding_tasks:
+                            forwarding_tasks[admin_id]['stats'].update({
+                                'processed': processed,
+                                'success': success,
+                                'skipped': skipped,
+                                'current_msg_id': message.id
+                            })
 
-                    now = time.time()
-                    nonlocal last_update_time, current_msg_id
-                    current_msg_id = message.id
-                    if now - last_update_time > 3:
-                        last_update_time = now
-                        progress_text = (
-                            f"⏳ **Hybrid Forwarding Engine**\n\n"
-                            f"📌 Msg ID: `{current_msg_id}`\n"
-                            f"📊 Progress: {processed}/{total_ids}\n"
-                            f"✅ Sent: {success}  |  ⏭️ Skipped: {skipped}\n"
-                            f"🔧 Mode: {mode_label}\n"
-                            f"🎬 FFmpeg: {ffmpeg_status}"
-                        )
-                        await safe_bot_edit(bot_client, admin_id, status_msg.id, progress_text)
-
-        # Run producer and consumer concurrently (pipeline)
-        await asyncio.gather(producer(), consumer())
+                        now = time.time()
+                        current_msg_id = message.id
+                        if now - last_update_time > 3:
+                            last_update_time = now
+                            progress_text = (
+                                f"⏳ **Hybrid Forwarding Engine**\n\n"
+                                f"📌 Msg ID: `{current_msg_id}`\n"
+                                f"📊 Progress: {processed}/{total_ids}\n"
+                                f"✅ Sent: {success}  |  ⏭️ Skipped: {skipped}\n"
+                                f"🔧 Mode: {mode_label}\n"
+                                f"🎬 FFmpeg: {ffmpeg_status}"
+                            )
+                            await safe_bot_edit(bot_client, admin_id, status_msg.id, progress_text)
+                            
+            except Exception as e:
+                logger.error(f"[User {admin_id}] Batch fetch error (ids {batch_ids[0]}-{batch_ids[-1]}): {e}")
+                skipped += len(batch_ids)
+                processed += len(batch_ids)
 
         await bot_client.send_message(
             admin_id,
@@ -568,7 +688,7 @@ async def start_forwarding_task(user_client, chat_id, start_id, end_id, dest_gro
 async def cancel_task_only(admin_id):
     """Cancel the forwarding task but keep the session alive."""
     if admin_id in forwarding_tasks:
-        forwarding_tasks[admin_id].cancel()
+        forwarding_tasks[admin_id]['task'].cancel()
         del forwarding_tasks[admin_id]
         return True
     return False
@@ -640,17 +760,19 @@ async def show_step_prompt(step, event_or_respond, state):
         ffmpeg_note = "\n✅ FFmpeg On — videos will be streamable." if FFMPEG_AVAILABLE else "\n⚠️ FFmpeg Off — install FFmpeg for streaming."
         buttons = [
             [Button.inline("🖼️ Yes, Custom Thumbnail", data=b"thumb_yes"),
-             Button.inline("❌ No Thumbnail", data=b"thumb_no")],
+             Button.inline("⚡ Instant Copy (No Thumb)", data=b"thumb_no")],
             BACK_BTN[0]
         ]
-        await r(f"Do you want a **custom thumbnail** for videos?{ffmpeg_note}", buttons)
+        await r(f"Do you want a **custom thumbnail** for videos?\n\n⚠️ **WARNING:** Using a custom thumbnail completely disables Instant Copy and forces a slow download/upload process.{ffmpeg_note}", buttons)
     elif step == 'wait_thumbnail':
         await r("🖼️ Send the **photo** to use as thumbnail for videos.", BACK_BTN)
     elif step == 'caption_option':
         buttons = [
             [Button.inline("📝 Keep Original", data=b"cap_keep")],
             [Button.inline("🗑️ Remove All", data=b"cap_remove")],
-            [Button.inline("✏️ Custom Caption", data=b"cap_custom")],
+            [Button.inline("✏️ Custom Template", data=b"cap_custom")],
+            [Button.inline("✍️ Edit Current Caption", data=b"cap_edit_current")],
+            [Button.inline("🏷️ Add 'Extracted by'", data=b"cap_add_extracted")],
             BACK_BTN[0]
         ]
         await r("How do you want to handle **captions**?", buttons)
@@ -661,6 +783,8 @@ async def show_step_prompt(step, event_or_respond, state):
             "Example: `{original_caption}\n📁 {filename} | 📦 {size}`",
             BACK_BTN
         )
+    elif step == 'wait_edit_caption' or step == 'wait_add_extracted':
+        await r("✏️ Send your caption input...", BACK_BTN)
 
 async def main():
     load_dotenv()
@@ -679,7 +803,12 @@ async def main():
         logger.error("API_ID must be a number.")
         return
 
-    bot_client = TelegramClient(BOT_SESSION, api_id, api_hash)
+    bot_client = TelegramClient(
+        BOT_SESSION, api_id, api_hash,
+        connection_retries=10,
+        request_retries=5,
+        flood_sleep_threshold=60,
+    )
     await bot_client.start(bot_token=bot_token)  # type: ignore
     
     # Set GUI Commands
@@ -715,13 +844,13 @@ async def main():
         
         if sender_id in forwarding_tasks:
             await event.respond("🛑 Stopping previous forwarding task before starting a new one...")
-            forwarding_tasks[sender_id].cancel()
+            forwarding_tasks[sender_id]['task'].cancel()
         
         task = asyncio.create_task(start_forwarding_task(
             user_client, chat_id, start_id, end_id, dest_group,
             bot_client, sender_id, thumb_path, caption_rule
         ))
-        forwarding_tasks[sender_id] = task
+        forwarding_tasks[sender_id] = {'task': task, 'stats': {}}
         
         await event.respond(
             "🚀 **Configuration Complete!**\n"
@@ -796,10 +925,17 @@ async def main():
     async def status_command(event):
         sender_id = event.sender_id
         if sender_id in forwarding_tasks:
-            await event.respond(
-                "🔄 **A forwarding task is currently running.**\n"
-                "Use /stop to cancel it (you'll stay logged in), or /logout to stop and delete your session."
+            stats = forwarding_tasks[sender_id].get('stats', {})
+            txt = (
+                f"🔄 **Forwarding Task Running**\n\n"
+                f"📊 Progress: {stats.get('processed', 0)} / {stats.get('total', 0)}\n"
+                f"✅ Sent: {stats.get('success', 0)}\n"
+                f"⏭️ Skipped: {stats.get('skipped', 0)}\n"
+                f"📌 Current Msg ID: {stats.get('current_msg_id', 'N/A')}\n"
+                f"🔧 Mode: {stats.get('mode', 'N/A')}\n\n"
+                f"Use /stop to cancel it (you'll stay logged in)."
             )
+            await event.respond(txt)
         elif sender_id in active_userbots:
             await event.respond(
                 "✅ **Logged in** — No active forwarding task.\n"
@@ -843,7 +979,9 @@ async def main():
                 buttons = [
                     [Button.inline("📝 Keep Original", data=b"cap_keep")],
                     [Button.inline("🗑️ Remove All", data=b"cap_remove")],
-                    [Button.inline("✏️ Custom Caption", data=b"cap_custom")],
+                    [Button.inline("✏️ Custom Template", data=b"cap_custom")],
+                    [Button.inline("✍️ Edit Current Caption", data=b"cap_edit_current")],
+                    [Button.inline("🏷️ Add 'Extracted by'", data=b"cap_add_extracted")],
                     BACK_BTN[0]
                 ]
                 await event.edit("How do you want to handle **captions**?", buttons=buttons)
@@ -864,6 +1002,37 @@ async def main():
                     "Variables:\n"
                     "`{filename}` `{size}` `{date}` `{original_caption}`\n\n"
                     "Example: `{original_caption}\n📁 {filename} | 📦 {size}`",
+                    buttons=BACK_BTN
+                )
+            elif data == 'cap_edit_current':
+                state['step'] = 'wait_edit_caption'
+                await event.edit("Fetching original caption...")
+                try:
+                    msg = await state['user_client'].get_messages(state['chat_id'], ids=state['start_id'])
+                    from telethon.extensions import markdown
+                    orig_text = markdown.unparse(msg.message or "", msg.entities or [])
+                    if orig_text:
+                        await event.edit(
+                            f"📝 **Edit Current Caption**\n\n"
+                            f"Tap the text below to copy it, make your changes, and send it back to me:\n\n"
+                            f"`{orig_text}`",
+                            buttons=BACK_BTN
+                        )
+                    else:
+                        await event.edit(
+                            "❌ The selected starting message has no caption.\n"
+                            "Please send the new caption you'd like to use:",
+                            buttons=BACK_BTN
+                        )
+                except Exception as e:
+                    await event.edit(f"❌ Failed to fetch message: {e}\nPlease send your custom caption:")
+                    
+            elif data == 'cap_add_extracted':
+                state['step'] = 'wait_add_extracted'
+                await event.edit(
+                    "🏷️ **Add 'Extracted by' Text**\n\n"
+                    "Send the text you want to append to the end of the original caption.\n"
+                    "Example: `\n\n🚀 Extracted by @MyChannel`",
                     buttons=BACK_BTN
                 )
 
@@ -1013,6 +1182,16 @@ async def main():
         elif step == 'wait_caption':
             state['caption_rule'] = text
             await event.respond("✅ Custom caption template saved!")
+            await start_task_from_state(event, state, sender_id)
+
+        elif step == 'wait_edit_caption':
+            state['caption_rule'] = text
+            await event.respond("✅ Edited caption saved!")
+            await start_task_from_state(event, state, sender_id)
+            
+        elif step == 'wait_add_extracted':
+            state['caption_rule'] = "{original_caption}\n" + text
+            await event.respond("✅ 'Extracted by' text saved!")
             await start_task_from_state(event, state, sender_id)
 
     try:
